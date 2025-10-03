@@ -332,6 +332,7 @@ def logged_in() -> bool:
 
 with st.sidebar:
     st.header("🔐 Authentication")
+    st.text("Enter your Jira credentials. No data is stored server-side; only in session RAM. Create an API token in https://id.atlassian.com/manage-profile/security/api-tokens.")
     if not logged_in():
         with st.form("login"):
             base = st.text_input("Jira Base URL", placeholder="https://your-domain.atlassian.net")
