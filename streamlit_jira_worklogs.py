@@ -140,12 +140,75 @@ def collect_issue_worklogs(base, email, token, issue_key: str) -> List[Dict[str,
             break
     return all_logs
 
+def resolve_epic_for_issue(base, email, token, issue: Dict[str, Any], epic_cache: Dict[str, Optional[str]]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Liefert (epic_key, epic_summary) für ein Issue.
+    Versucht in dieser Reihenfolge:
+      1) Team-managed: fields.epic -> {"key","name"}
+      2) Parent ist ein Epic
+      3) Company-managed: Epic Link Customfield (häufig customfield_10014) -> epic_key
+         -> Summary via GET /issue/{epic_key} (mit Cache)
+    """
+    f = issue.get("fields") or {}
+
+    # 1) Team-managed: direct epic object
+    epic_obj = f.get("epic")
+    if isinstance(epic_obj, dict):
+        ekey = epic_obj.get("key") or epic_obj.get("id")
+        ename = epic_obj.get("name") or epic_obj.get("summary")
+        # Falls Name fehlt, optional nachladen
+        if ekey and not ename:
+            if ekey in epic_cache:
+                ename = epic_cache[ekey]
+            else:
+                try:
+                    data = jira_req(base, email, token, "GET", f"/rest/api/3/issue/{ekey}", params={"fields": "summary"})
+                    ename = (data.get("fields") or {}).get("summary")
+                except Exception:
+                    ename = None
+                epic_cache[ekey] = ename
+        return ekey, ename
+
+    # 2) Parent ist Epic? (bei Sub-Tasks in Company-managed kann der Parent ein Story sein -> prüfen)
+    parent = f.get("parent")
+    if isinstance(parent, dict) and parent.get("key"):
+        # wenn parent.fields.issuetype.name == "Epic" vorhanden ist, direkt verwenden
+        p_fields = parent.get("fields") or {}
+        p_type = (p_fields.get("issuetype") or {}).get("name")
+        if p_type == "Epic":
+            return parent.get("key"), p_fields.get("summary")
+        # Falls der Typ fehlt, notfalls nachladen und prüfen
+        pkey = parent.get("key")
+        try:
+            data = jira_req(base, email, token, "GET", f"/rest/api/3/issue/{pkey}", params={"fields": "issuetype,summary"})
+            if ((data.get("fields") or {}).get("issuetype") or {}).get("name") == "Epic":
+                return pkey, (data.get("fields") or {}).get("summary")
+        except Exception:
+            pass  # dann weiter versuchen
+
+    # 3) Klassisches Epic-Link Customfield (häufig customfield_10014)
+    ekey = f.get("customfield_10014")
+    if ekey:
+        if ekey in epic_cache:
+            return ekey, epic_cache[ekey]
+        try:
+            data = jira_req(base, email, token, "GET", f"/rest/api/3/issue/{ekey}", params={"fields": "summary"})
+            ename = (data.get("fields") or {}).get("summary")
+        except Exception:
+            ename = None
+        epic_cache[ekey] = ename
+        return ekey, ename
+
+    return None, None
+
+
+
 # ------------------------ Exports ------------------------
 def export_month_all_staff(base, email, token, ym: str, jql_scope: Optional[str], local_tz: str, grain: str) -> bytes:
     """
     grain: 'Monthly' or 'Weekly'
     - Monthly: one sheet per employee (+ Overview)
-    - Weekly:   one sheet per employee (includes Week columns) + Weekly Overview sheet
+    - Weekly:   one sheet per employee (+ Weekly Overview)
     """
     tzinfo_local = ZoneInfo(local_tz)
     start, end = month_bounds(ym)
@@ -155,18 +218,26 @@ def export_month_all_staff(base, email, token, ym: str, jql_scope: Optional[str]
     jql = f'worklogDate >= "{date_from}" AND worklogDate <= "{date_to}"'
     if jql_scope: jql = f"({jql_scope}) AND ({jql})"
 
-    issues = search_issues_jql(base, email, token, jql=jql, fields=["summary"])
+    # WICHTIG: zusätzliche Felder anfordern
+    issues = search_issues_jql(base, email, token, jql=jql, fields=["summary","parent","issuetype","epic","customfield_10014"])
+
     by_person: Dict[str, List[Dict[str, Any]]] = {}
+    epic_cache: Dict[str, Optional[str]] = {}
 
     for it in issues:
-        key = it.get("key"); summary = (it.get("fields") or {}).get("summary")
+        key = it.get("key"); fields = it.get("fields") or {}
+        summary = fields.get("summary")
+        # Epic bestimmen (Key + Summary)
+        epic_key, epic_summary = resolve_epic_for_issue(base, email, token, it, epic_cache)
+
         for wl in collect_issue_worklogs(base, email, token, key):
             try:
                 dt_utc = parse_started(wl.get("started"))
             except Exception:
                 continue
-            if not (start <= dt_utc <= end): 
+            if not (start <= dt_utc <= end):
                 continue
+
             dt_local = dt_utc.astimezone(tzinfo_local)
             secs = wl.get("timeSpentSeconds") or 0
             comment = wl.get("comment", "")
@@ -176,10 +247,12 @@ def export_month_all_staff(base, email, token, ym: str, jql_scope: Optional[str]
             row = {
                 "Local datetime": dt_local.strftime("%Y-%m-%d %H:%M:%S"),
                 "Weekday": WEEKDAY_EN[dt_local.weekday()],
-                "ISO Week": week_key_local(dt_local),           # weekly metadata
+                "ISO Week": week_key_local(dt_local),
                 "UTC datetime": dt_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "Issue": key,
                 "Summary": summary,
+                "Epic Key": epic_key or "",
+                "Epic Summary": epic_summary or "",
                 "Seconds": secs,
                 "Hours": round(secs / 3600.0, 2),
                 "Comment": comment if isinstance(comment, str) else str(comment),
@@ -213,6 +286,7 @@ def export_month_all_staff(base, email, token, ym: str, jql_scope: Optional[str]
     output.seek(0)
     return output.read()
 
+
 def list_employees_in_range(base, email, token, from_ym: str, to_ym: str, jql_scope: Optional[str]) -> Dict[str, Dict[str, str]]:
     start_all, end_all = month_bounds(from_ym)[0], month_bounds(to_ym)[1]
     date_from = start_all.astimezone(timezone.utc).strftime("%Y-%m-%d")
@@ -221,7 +295,7 @@ def list_employees_in_range(base, email, token, from_ym: str, to_ym: str, jql_sc
     if jql_scope: jql = f"({jql_scope}) AND ({jql})"
 
     emp: Dict[str, Dict[str, str]] = {}
-    issues = search_issues_jql(base, email, token, jql=jql, fields=["summary"])
+    issues = search_issues_jql(base, email, token, jql=jql, ["summary", "parent", "issuetype", "epic", "customfield_10014"])
     for it in issues:
         key = it.get("key")
         for wl in collect_issue_worklogs(base, email, token, key):
@@ -255,21 +329,26 @@ def export_employee_timeline(base, email, token, account_id: str,
     if jql_scope:
         jql = f"({jql_scope}) AND ({jql})"
 
-    issues = search_issues_jql(base, email, token, jql=jql, fields=["summary"])
+    # WICHTIG: zusätzliche Felder anfordern
+    issues = search_issues_jql(base, email, token, jql=jql, fields=["summary","parent","issuetype","epic","customfield_10014"])
 
-    # Prepare buckets
+    # Buckets vorbereiten
     if grain == "Monthly":
-        buckets = {ym: [] for ym in month_iter(from_ym, to_ym)}
+        buckets: Dict[str, List[Dict[str, Any]]] = {ym: [] for ym in month_iter(from_ym, to_ym)}
         def bucket_key(dt_local: datetime) -> str:
             return f"{dt_local.year:04d}-{dt_local.month:02d}"
     else:
-        buckets = {}  # create on the fly
+        buckets = {}
         def bucket_key(dt_local: datetime) -> str:
             return week_key_local(dt_local)
 
+    epic_cache: Dict[str, Optional[str]] = {}
+
     for it in issues:
-        key = it.get("key")
-        summary = (it.get("fields") or {}).get("summary")
+        key = it.get("key"); fields = it.get("fields") or {}
+        summary = fields.get("summary")
+        epic_key, epic_summary = resolve_epic_for_issue(base, email, token, it, epic_cache)
+
         for wl in collect_issue_worklogs(base, email, token, key):
             try:
                 dt_utc = parse_started(wl.get("started"))
@@ -286,37 +365,38 @@ def export_employee_timeline(base, email, token, account_id: str,
             comment = wl.get("comment", "")
             if isinstance(comment, dict):
                 comment = comment.get("content") or ""
+
             row = {
                 "Local datetime": dt_local.strftime("%Y-%m-%d %H:%M:%S"),
                 "Weekday": WEEKDAY_EN[dt_local.weekday()],
-                "ISO Week": week_key_local(dt_local),   # helpful column even for Monthly grain
+                "ISO Week": week_key_local(dt_local),
                 "UTC datetime": dt_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "Issue": key,
                 "Summary": summary,
+                "Epic Key": epic_key or "",
+                "Epic Summary": epic_summary or "",
                 "Seconds": secs,
                 "Hours": round(secs / 3600.0, 2),
                 "Comment": comment if isinstance(comment, str) else str(comment),
             }
-            bkey = bucket_key(dt_local)
-            buckets.setdefault(bkey, []).append(row)
+            buckets.setdefault(bucket_key(dt_local), []).append(row)
 
-    # Build workbook in-memory
+    # Workbook
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         overview_rows = []
+        label = "Month" if grain == "Monthly" else "ISO Week"
         for bkey in sorted(buckets.keys()):
-            rows = buckets[bkey]
-            df = pd.DataFrame(rows)
+            df = pd.DataFrame(buckets[bkey])
             if not df.empty:
                 df = df.sort_values(["Local datetime", "Issue"])
             else:
                 df = pd.DataFrame(columns=[
                     "Local datetime","Weekday","ISO Week","UTC datetime","Issue",
-                    "Summary","Seconds","Hours","Comment"
+                    "Summary","Epic Key","Epic Summary","Seconds","Hours","Comment"
                 ])
             df.to_excel(writer, index=False, sheet_name=safe_sheet_name(bkey))
             total_h = round(float(df["Hours"].sum()), 2) if not df.empty else 0.0
-            label = "Month" if grain == "Monthly" else "ISO Week"
             overview_rows.append({label: bkey, "Entries": len(df), "Total Hours": total_h})
 
         if overview_rows:
