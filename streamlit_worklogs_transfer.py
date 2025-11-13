@@ -14,10 +14,11 @@ DATE_COL = "Date"
 START_COL = "Start Time"
 END_COL = "End Time"
 TEXT_COL = "Text/Description"
+HOURTYPE_COL = "Hour Type"
 
 # Columns inside Employees.xlsx
 EMP_RESOURCE_COL = "Resource No."
-EMP_PERSONAL_COL = "Personal Number"  # adjust if your file uses different naming
+EMP_PERSONAL_COL = "Pers.Nr."  # adjust if your file uses different naming
 
 # Constants for eco2ve_TimeSheet
 CONST_D = "P.0785215.1.02 "
@@ -47,7 +48,7 @@ def read_all_worklogs(month_folder: Path) -> pd.DataFrame:
     """Read all .xlsx files inside the monthly folder except templates."""
     xlsx_files = [
         f for f in month_folder.glob("*.xlsx")
-        if f.name.lower() not in ["employees.xlsx", "eco2ve_timesheet.xlsx"]
+        if f.name.lower() not in ["employees.xlsx", "eco2ve_timesheet.xlsx"] and "eco2vetimesheet" not in f.name.lower()
     ]
 
     if not xlsx_files:
@@ -56,12 +57,23 @@ def read_all_worklogs(month_folder: Path) -> pd.DataFrame:
     dfs = []
     for f in xlsx_files:
         df = pd.read_excel(f)
-        for col in [RESOURCE_COL, DATE_COL, START_COL, END_COL, TEXT_COL]:
+
+        # Check required columns
+        required = [RESOURCE_COL, DATE_COL, START_COL, END_COL, TEXT_COL, HOURTYPE_COL]
+        for col in required:
             if col not in df.columns:
                 raise ValueError(
                     f"File {f.name} is missing the required column '{col}'. "
                     "Please check this worklog file."
                 )
+
+        # Keep only billable hours
+        before_count = len(df)
+        df = df[df[HOURTYPE_COL].astype(str).str.lower() == "billable"]
+
+        if len(df) < before_count:
+            st.warning(f"{f.name}: {before_count - len(df)} entries ignored (not billable)")
+
         dfs.append(df[[RESOURCE_COL, DATE_COL, START_COL, END_COL, TEXT_COL]])
 
     combined = pd.concat(dfs, ignore_index=True)
