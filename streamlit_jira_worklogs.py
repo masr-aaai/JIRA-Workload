@@ -140,12 +140,44 @@ def collect_issue_worklogs(base, email, token, issue_key: str) -> List[Dict[str,
             break
     return all_logs
 
+def extract_worklog_datetimes(wl: Dict[str, Any], tzinfo_local):
+    """
+    Liefert:
+      - started_utc / started_local: Startzeit des Worklogs (falls vorhanden)
+      - created_utc / created_local: Zeitpunkt, wann die Buchung angelegt wurde (falls vorhanden)
+      - effective_utc / effective_local: 'maßgebliches' Datum zum Gruppieren/Bucketn
+        (Prefer started*, sonst created*)
+    Alle Werte können None sein, wenn das jeweilige Feld fehlt oder unparsbar.
+    """
+    started_raw = wl.get("started")
+    created_raw = wl.get("created") or wl.get("updated")  # created bevorzugen, sonst zumindest updated
+
+    started_utc = started_local = created_utc = created_local = None
+    if started_raw:
+        try:
+            started_utc = parse_started(started_raw)
+            started_local = started_utc.astimezone(tzinfo_local)
+        except Exception:
+            started_utc = started_local = None
+    if created_raw:
+        try:
+            created_utc = parse_started(created_raw)
+            created_local = created_utc.astimezone(tzinfo_local)
+        except Exception:
+            created_utc = created_local = None
+
+    effective_utc = started_utc or created_utc
+    effective_local = started_local or created_local
+    return started_utc, started_local, created_utc, created_local, effective_utc, effective_local
+
+
 # ------------------------ Exports ------------------------
 def export_month_all_staff(base, email, token, ym: str, jql_scope: Optional[str], local_tz: str, grain: str) -> bytes:
     """
     grain: 'Monthly' or 'Weekly'
     - Monthly: one sheet per employee (+ Overview)
-    - Weekly:   one sheet per employee (includes Week columns) + Weekly Overview sheet
+    - Weekly:   one sheet per employee (+ Weekly Overview)
+    Bucket-Key basiert auf dem Starting date (falls vorhanden), sonst created.
     """
     tzinfo_local = ZoneInfo(local_tz)
     start, end = month_bounds(ym)
@@ -153,31 +185,44 @@ def export_month_all_staff(base, email, token, ym: str, jql_scope: Optional[str]
     date_to = end.astimezone(timezone.utc).strftime("%Y-%m-%d")
 
     jql = f'worklogDate >= "{date_from}" AND worklogDate <= "{date_to}"'
-    if jql_scope: jql = f"({jql_scope}) AND ({jql})"
+    if jql_scope:
+        jql = f"({jql_scope}) AND ({jql})"
 
     issues = search_issues_jql(base, email, token, jql=jql, fields=["summary"])
     by_person: Dict[str, List[Dict[str, Any]]] = {}
 
     for it in issues:
-        key = it.get("key"); summary = (it.get("fields") or {}).get("summary")
+        key = it.get("key")
+        summary = (it.get("fields") or {}).get("summary")
         for wl in collect_issue_worklogs(base, email, token, key):
-            try:
-                dt_utc = parse_started(wl.get("started"))
-            except Exception:
+            # Alle relevanten Zeiten ziehen
+            (started_utc, started_local,
+             created_utc, created_local,
+             effective_utc, effective_local) = extract_worklog_datetimes(wl, tzinfo_local)
+
+            # Filtern: auf Monatsfenster anhand des Starting date (oder created, falls started fehlt)
+            if not effective_utc:
                 continue
-            if not (start <= dt_utc <= end): 
+            if not (start <= effective_utc <= end):
                 continue
-            dt_local = dt_utc.astimezone(tzinfo_local)
+
             secs = wl.get("timeSpentSeconds") or 0
             comment = wl.get("comment", "")
             if isinstance(comment, dict):
                 comment = comment.get("content") or ""
 
             row = {
-                "Local datetime": dt_local.strftime("%Y-%m-%d %H:%M:%S"),
-                "Weekday": WEEKDAY_EN[dt_local.weekday()],
-                "ISO Week": week_key_local(dt_local),           # weekly metadata
-                "UTC datetime": dt_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                # Sichtbarkeit der Start- und Buchungszeitpunkte
+                "Started (local)": started_local.strftime("%Y-%m-%d %H:%M:%S") if started_local else "",
+                "Started (UTC)": started_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if started_utc else "",
+                "Logged (local)": created_local.strftime("%Y-%m-%d %H:%M:%S") if created_local else "",
+                "Logged (UTC)": created_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if created_utc else "",
+                # Gruppierungs-/Darstellungszeitpunkt
+                "Local datetime": effective_local.strftime("%Y-%m-%d %H:%M:%S"),
+                "Weekday": WEEKDAY_EN[effective_local.weekday()],
+                "ISO Week": week_key_local(effective_local),
+                "UTC datetime": effective_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                # Kontext
                 "Issue": key,
                 "Summary": summary,
                 "Seconds": secs,
@@ -203,7 +248,11 @@ def export_month_all_staff(base, email, token, ym: str, jql_scope: Optional[str]
             if grain == "Weekly" and not df.empty:
                 wk = df.groupby("ISO Week", dropna=False)["Hours"].sum().reset_index()
                 for _, r in wk.iterrows():
-                    weekly_overview_rows.append({"Employee": person, "ISO Week": r["ISO Week"], "Total Hours": round(float(r["Hours"]), 2)})
+                    weekly_overview_rows.append({
+                        "Employee": person,
+                        "ISO Week": r["ISO Week"],
+                        "Total Hours": round(float(r["Hours"]), 2)
+                    })
 
         if overview:
             pd.DataFrame(overview).sort_values("Employee").to_excel(writer, index=False, sheet_name="Overview")
@@ -246,6 +295,7 @@ def export_employee_timeline(base, email, token, account_id: str,
     For a single employee:
       - Monthly grain:  sheet per YYYY-MM
       - Weekly grain:   sheet per ISO week (YYYY-Www)
+    Bucket-Key basiert auf dem Starting date (falls vorhanden), sonst created.
     """
     tzinfo_local = ZoneInfo(local_tz)
     start_all, end_all = month_bounds(from_ym)[0], month_bounds(to_ym)[1]
@@ -257,13 +307,13 @@ def export_employee_timeline(base, email, token, account_id: str,
 
     issues = search_issues_jql(base, email, token, jql=jql, fields=["summary"])
 
-    # Prepare buckets
+    # Prepare buckets (by Month or ISO Week) – based on effective_local
     if grain == "Monthly":
-        buckets = {ym: [] for ym in month_iter(from_ym, to_ym)}
+        buckets: Dict[str, List[Dict[str, Any]]] = {ym: [] for ym in month_iter(from_ym, to_ym)}
         def bucket_key(dt_local: datetime) -> str:
             return f"{dt_local.year:04d}-{dt_local.month:02d}"
     else:
-        buckets = {}  # create on the fly
+        buckets = {}
         def bucket_key(dt_local: datetime) -> str:
             return week_key_local(dt_local)
 
@@ -271,52 +321,56 @@ def export_employee_timeline(base, email, token, account_id: str,
         key = it.get("key")
         summary = (it.get("fields") or {}).get("summary")
         for wl in collect_issue_worklogs(base, email, token, key):
-            try:
-                dt_utc = parse_started(wl.get("started"))
-            except Exception:
-                continue
-            if not (start_all <= dt_utc <= end_all):
+            (started_utc, started_local,
+             created_utc, created_local,
+             effective_utc, effective_local) = extract_worklog_datetimes(wl, tzinfo_local)
+
+            # Zeitraumfilter anhand effective_utc (started bevorzugt)
+            if not effective_utc or not (start_all <= effective_utc <= end_all):
                 continue
             author = (wl.get("author") or {})
             if author.get("accountId") != account_id:
                 continue
 
-            dt_local = dt_utc.astimezone(tzinfo_local)
             secs = wl.get("timeSpentSeconds") or 0
             comment = wl.get("comment", "")
             if isinstance(comment, dict):
                 comment = comment.get("content") or ""
+
             row = {
-                "Local datetime": dt_local.strftime("%Y-%m-%d %H:%M:%S"),
-                "Weekday": WEEKDAY_EN[dt_local.weekday()],
-                "ISO Week": week_key_local(dt_local),   # helpful column even for Monthly grain
-                "UTC datetime": dt_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "Started (local)": started_local.strftime("%Y-%m-%d %H:%M:%S") if started_local else "",
+                "Started (UTC)": started_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if started_utc else "",
+                "Logged (local)": created_local.strftime("%Y-%m-%d %H:%M:%S") if created_local else "",
+                "Logged (UTC)": created_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if created_utc else "",
+                "Local datetime": effective_local.strftime("%Y-%m-%d %H:%M:%S"),
+                "Weekday": WEEKDAY_EN[effective_local.weekday()],
+                "ISO Week": week_key_local(effective_local),
+                "UTC datetime": effective_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "Issue": key,
                 "Summary": summary,
                 "Seconds": secs,
                 "Hours": round(secs / 3600.0, 2),
                 "Comment": comment if isinstance(comment, str) else str(comment),
             }
-            bkey = bucket_key(dt_local)
-            buckets.setdefault(bkey, []).append(row)
+            buckets.setdefault(bucket_key(effective_local), []).append(row)
 
     # Build workbook in-memory
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         overview_rows = []
+        label = "Month" if grain == "Monthly" else "ISO Week"
         for bkey in sorted(buckets.keys()):
-            rows = buckets[bkey]
-            df = pd.DataFrame(rows)
+            df = pd.DataFrame(buckets[bkey])
             if not df.empty:
                 df = df.sort_values(["Local datetime", "Issue"])
             else:
                 df = pd.DataFrame(columns=[
+                    "Started (local)","Started (UTC)","Logged (local)","Logged (UTC)",
                     "Local datetime","Weekday","ISO Week","UTC datetime","Issue",
                     "Summary","Seconds","Hours","Comment"
                 ])
             df.to_excel(writer, index=False, sheet_name=safe_sheet_name(bkey))
             total_h = round(float(df["Hours"].sum()), 2) if not df.empty else 0.0
-            label = "Month" if grain == "Monthly" else "ISO Week"
             overview_rows.append({label: bkey, "Entries": len(df), "Total Hours": total_h})
 
         if overview_rows:
