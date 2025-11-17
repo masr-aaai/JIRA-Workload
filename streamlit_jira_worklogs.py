@@ -170,6 +170,124 @@ def extract_worklog_datetimes(wl: Dict[str, Any], tzinfo_local):
     effective_local = started_local or created_local
     return started_utc, started_local, created_utc, created_local, effective_utc, effective_local
 
+# --- Epic resolver with inheritance (team-managed + company-managed) ---
+# Requires: jira_req(...) already defined
+
+from typing import Optional, Tuple, Dict, Any
+
+def resolve_epic_for_issue(
+    base: str,
+    email: str,
+    token: str,
+    issue: Dict[str, Any],
+    epic_cache: Dict[str, Optional[str]],
+    issue_epic_cache: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (epic_key, epic_summary) for an issue with proper inheritance:
+      1) Team-managed: fields.epic {key|id, name|summary}
+      2) Company-managed: Epic Link customfield (commonly customfield_10014)
+      3) Parent fallback:
+         - if parent is Epic -> use parent
+         - else resolve parent's epic (one hop)
+    Caches:
+      - epic_cache: epic_key -> summary
+      - issue_epic_cache: issue_key -> (epic_key, epic_summary)
+    """
+    if issue_epic_cache is None:
+        issue_epic_cache = {}
+
+    ikey = issue.get("key")
+    if ikey in issue_epic_cache:
+        return issue_epic_cache[ikey]
+
+    f = issue.get("fields") or {}
+
+    def ensure_epic_summary(epic_key: str) -> Optional[str]:
+        if not epic_key:
+            return None
+        if epic_key in epic_cache:
+            return epic_cache[epic_key]
+        try:
+            data = jira_req(base, email, token, "GET", f"/rest/api/3/issue/{epic_key}", params={"fields": "summary"})
+            s = (data.get("fields") or {}).get("summary")
+        except Exception:
+            s = None
+        epic_cache[epic_key] = s
+        return s
+
+    # 1) Team-managed direct epic object
+    epic_obj = f.get("epic")
+    if isinstance(epic_obj, dict):
+        ekey = epic_obj.get("key") or epic_obj.get("id")
+        esum = epic_obj.get("name") or epic_obj.get("summary") or ensure_epic_summary(ekey)
+        issue_epic_cache[ikey] = (ekey, esum)
+        return ekey, esum
+
+    # 2) Company-managed Epic Link custom field (default id often customfield_10014)
+    ekey = f.get("customfield_10014")
+    if ekey:
+        esum = ensure_epic_summary(ekey)
+        issue_epic_cache[ikey] = (ekey, esum)
+        return ekey, esum
+
+    # 3) Inherit from parent (subtasks etc.)
+    parent = f.get("parent")
+    if isinstance(parent, dict) and parent.get("key"):
+        pkey = parent.get("key")
+        pfields = parent.get("fields") or {}
+        ptype = (pfields.get("issuetype") or {}).get("name")
+
+        # Parent is Epic
+        if ptype == "Epic":
+            esum = pfields.get("summary")
+            issue_epic_cache[ikey] = (pkey, esum)
+            return pkey, esum
+
+        # Parent might itself have an epic (use embedded data first)
+        pepic = pfields.get("epic")
+        if isinstance(pepic, dict):
+            e2 = pepic.get("key") or pepic.get("id")
+            s2 = pepic.get("name") or pepic.get("summary") or ensure_epic_summary(e2)
+            issue_epic_cache[ikey] = (e2, s2)
+            return e2, s2
+
+        e2 = pfields.get("customfield_10014")
+        if e2:
+            s2 = ensure_epic_summary(e2)
+            issue_epic_cache[ikey] = (e2, s2)
+            return e2, s2
+
+        # If still unknown, fetch parent once and inspect
+        if pkey in issue_epic_cache:
+            e2, s2 = issue_epic_cache[pkey]
+            issue_epic_cache[ikey] = (e2, s2)
+            return e2, s2
+
+        try:
+            pdata = jira_req(base, email, token, "GET", f"/rest/api/3/issue/{pkey}",
+                             params={"fields": "issuetype,summary,epic,customfield_10014"})
+            pf = (pdata.get("fields") or {})
+            if ((pf.get("issuetype") or {}).get("name")) == "Epic":
+                e2, s2 = pkey, pf.get("summary")
+            else:
+                pep = pf.get("epic")
+                if isinstance(pep, dict):
+                    e2 = pep.get("key") or pep.get("id")
+                    s2 = pep.get("name") or pep.get("summary") or ensure_epic_summary(e2)
+                else:
+                    e2 = pf.get("customfield_10014")
+                    s2 = ensure_epic_summary(e2) if e2 else None
+            issue_epic_cache[pkey] = (e2, s2)
+            issue_epic_cache[ikey] = (e2, s2)
+            return e2, s2
+        except Exception:
+            pass
+
+    # Nothing found
+    issue_epic_cache[ikey] = (None, None)
+    return None, None
+
 
 # ------------------------ Exports ------------------------
 def export_month_all_staff(base, email, token, ym: str, jql_scope: Optional[str], local_tz: str, grain: str) -> bytes:
@@ -378,6 +496,313 @@ def export_employee_timeline(base, email, token, account_id: str,
     output.seek(0)
     return output.read()
 
+def export_monthly_hierarchy_by_epic(
+    base: str,
+    email: str,
+    token: str,
+    from_ym: str,
+    to_ym: str,
+    jql_scope: Optional[str],
+    local_tz: str,
+    epic_link_field: Optional[str] = None,
+    scope_field: Optional[str] = None,
+    ) -> bytes:
+    """
+    Für den angegebenen Monats-Zeitraum:
+      - pro Monat ein Sheet
+      - pro Sheet: hierarchische Liste Epic -> Workitem -> Subtask
+      - 'h logged' = Summe der direkten Worklogs auf diesem Issue in diesem Monat
+    """
+    tzinfo_local = ZoneInfo(local_tz)
+
+    # Gesamtzeitraum über alle Monate
+    start_all, _ = month_bounds(from_ym)
+    _, end_all = month_bounds(to_ym)
+    date_from = start_all.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    date_to = end_all.astimezone(timezone.utc).strftime("%Y-%m-%d")
+
+    # JQL: Einschränkung auf Worklogs im Zeitraum + optionaler Scope
+    jql = f'worklogDate >= "{date_from}" AND worklogDate <= "{date_to}"'
+    if jql_scope:
+        jql = f"({jql_scope}) AND ({jql})"
+
+    # Felder für Hierarchie/Meta
+    fields = ["summary", "issuetype", "parent", "fixVersions"]
+    if epic_link_field:
+        fields.append(epic_link_field)
+    if scope_field:
+        fields.append(scope_field)
+
+    issues = search_issues_jql(
+        base, email, token,
+        jql=jql,
+        fields=fields
+    )
+
+
+    # Metadaten der Issues sammeln
+    issue_meta: Dict[str, Dict[str, Any]] = {}
+    parent_map: Dict[str, Optional[str]] = {}
+
+    for it in issues:
+        key = it.get("key")
+        if not key:
+            continue
+        f = it.get("fields") or {}
+
+        summary = f.get("summary") or ""
+        issuetype_name = ((f.get("issuetype") or {}).get("name") or "").strip()
+
+        # --- PARENT-BESTIMMUNG ---
+
+        parent_key = None
+
+        # 1) "echter" Parent (Subtask, z.B. Story -> Subtask)
+        parent_obj = f.get("parent")
+        if isinstance(parent_obj, dict):
+            parent_key = parent_obj.get("key")
+
+        # 2) Epic-Link (Story/Task unter Epic)
+        if not parent_key and epic_link_field and issuetype_name.lower() != "epic":
+            epic_val = f.get(epic_link_field)
+            if isinstance(epic_val, dict):
+                parent_key = epic_val.get("key") or epic_val.get("id")
+            elif isinstance(epic_val, str):
+                parent_key = epic_val
+            elif epic_val:
+                parent_key = str(epic_val)
+
+        # --- Release Version ---
+        release_version = ""
+        fv = f.get("fixVersions") or []
+        if isinstance(fv, list):
+            names = []
+            for v in fv:
+                if isinstance(v, dict):
+                    nm = v.get("name")
+                    if nm:
+                        names.append(str(nm))
+                else:
+                    names.append(str(v))
+            release_version = ", ".join(names)
+
+        # --- Scope (Custom Field) ---
+        scope_val = ""
+        if scope_field and scope_field in f:
+            sv = f.get(scope_field)
+            if isinstance(sv, dict):
+                scope_val = sv.get("value") or sv.get("name") or str(sv)
+            elif isinstance(sv, list):
+                parts = []
+                for item in sv:
+                    if isinstance(item, dict):
+                        parts.append(item.get("value") or item.get("name") or str(item))
+                    else:
+                        parts.append(str(item))
+                scope_val = ", ".join(parts)
+            elif sv is not None:
+                scope_val = str(sv)
+
+        issue_meta[key] = {
+            "key": key,
+            "summary": summary,
+            "issuetype": issuetype_name,
+            "parent": parent_key,          # <--- HIER SPEICHERN WIR DEN PARENT
+            "release_version": release_version,
+            "scope": scope_val,
+        }
+        parent_map[key] = parent_key
+
+    # Worklogs pro Monat & Issue aufsummieren (nur direkte Logs)
+    per_month_issue_hours: Dict[str, Dict[str, float]] = {}
+    months = month_iter(from_ym, to_ym)
+
+    for it in issues:
+        key = it.get("key")
+        if not key:
+            continue
+
+        for wl in collect_issue_worklogs(base, email, token, key):
+            (
+                started_utc, started_local,
+                created_utc, created_local,
+                effective_utc, effective_local
+            ) = extract_worklog_datetimes(wl, tzinfo_local)
+
+            if not effective_utc:
+                continue
+            if not (start_all <= effective_utc <= end_all):
+                continue
+
+            month_key = f"{effective_local.year:04d}-{effective_local.month:02d}"
+            if month_key not in months:
+                # Falls wegen Rundung irgendwas leicht rausfällt
+                continue
+
+            secs = wl.get("timeSpentSeconds") or 0
+            h = secs / 3600.0
+
+            per_month_issue_hours.setdefault(month_key, {})
+            per_month_issue_hours[month_key][key] = per_month_issue_hours[month_key].get(key, 0.0) + h
+
+    # Hilfsfunktion: alle Vorfahren eines Issues in die Menge aufnehmen
+    def add_ancestors(issue_key: str, active_set: set):
+        current = issue_key
+        visited = set()
+        while True:
+            parent = parent_map.get(current)
+            if not parent or parent in visited:
+                break
+            active_set.add(parent)
+            visited.add(parent)
+            current = parent
+
+    # Excel-Aufbau
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for m in months:
+            issue_hours = per_month_issue_hours.get(m, {})
+
+            # Zuerst: alle Issues mit Stunden in diesem Monat
+            active_issues = set(issue_hours.keys())
+
+            # Dann: alle Vorfahren (Epics, Workitems ohne direkte Logs etc.) ergänzen
+            for ik in list(active_issues):
+                add_ancestors(ik, active_issues)
+
+            # Auf Basis dieser Menge die Hierarchie bauen
+            # children_map: parent → [child1, child2, ...]
+            children_map: Dict[Optional[str], List[str]] = {}
+            for ik in active_issues:
+                meta = issue_meta.get(ik)
+                if not meta:
+                    continue
+                p = meta.get("parent")
+                # Nur Eltern berücksichtigen, die ebenfalls in active_issues liegen,
+                # sonst ist es ein Root (parent=None)
+                if p not in active_issues:
+                    p = None
+                children_map.setdefault(p, []).append(ik)
+
+            # Kinder sortieren (z.B. nach Issue-Key)
+            for p in children_map:
+                children_map[p].sort()
+
+            # Roots: solche ohne Parent in active_issues
+            roots = children_map.get(None, [])
+            roots.sort()
+
+            rows: List[Dict[str, Any]] = []
+
+            def walk(node_key: str, depth: int = 0):
+                meta = issue_meta.get(node_key)
+                if not meta:
+                    return
+
+                hours = round(issue_hours.get(node_key, 0.0), 2)
+                parent_key = meta.get("parent") or ""   # <-- das, was wir oben gesetzt haben
+
+                rows.append({
+                    "tasknummer": node_key,
+                    "summary": ("  " * depth) + meta.get("summary", ""),
+                    "parent": parent_key,
+                    "h logged": hours,
+                    "release version": meta.get("release_version", ""),
+                    "Scope": meta.get("scope", ""),
+                })
+
+                for child in children_map.get(node_key, []):
+                    walk(child, depth + 1)
+
+
+            for r in roots:
+                walk(r, depth=0)
+
+            # DataFrame bauen; wenn leer, trotzdem leeres Sheet mit Spaltenköpfen
+            if rows:
+                df = pd.DataFrame(rows)
+            else:
+                df = pd.DataFrame(columns=["tasknummer", "summary", "parent", "h logged", "release version", "Scope"])
+
+            df.to_excel(writer, index=False, sheet_name=safe_sheet_name(m))
+
+    output.seek(0)
+    return output.read()
+
+
+def export_jql_issues_excel(base, email, token, jql: str, local_tz: str) -> bytes:
+    """
+    Runs an arbitrary JQL (enhanced /search/jql) and exports a flat issue list to Excel.
+    Columns: Key, Issue Type, Summary, Status, Assignee, Reporter, Epic Key, Epic Summary,
+             Fix Versions, Parent, Created, Updated, Priority
+    """
+    # Caches for epic lookups
+    epic_cache: Dict[str, Optional[str]] = {}
+    issue_epic_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+
+    # ask for all fields we might render
+    fields = [
+        "summary", "issuetype", "status", "assignee", "reporter", "priority",
+        "parent", "epic", "customfield_10014", "fixVersions", "created", "updated"
+    ]
+    issues = search_issues_jql(base, email, token, jql=jql, fields=fields)
+
+    rows = []
+    for it in issues:
+        key = it.get("key")
+        f = it.get("fields") or {}
+        issue_type = ((f.get("issuetype") or {}).get("name")) or ""
+        status = ((f.get("status") or {}).get("name")) or ""
+        assignee = ((f.get("assignee") or {}).get("displayName")) or ""
+        reporter = ((f.get("reporter") or {}).get("displayName")) or ""
+        priority = ((f.get("priority") or {}).get("name")) or ""
+        parent_key = (f.get("parent") or {}).get("key") or ""
+        summary = f.get("summary") or ""
+        created = f.get("created") or ""
+        updated = f.get("updated") or ""
+        # Fix Versions (names joined)
+        fx_names = ", ".join([v.get("name") for v in (f.get("fixVersions") or []) if v.get("name")])
+
+        # Resolve epic with inheritance (subtasks inherit parent's epic)
+        e_key, e_sum = resolve_epic_for_issue(
+            base, email, token, it,
+            epic_cache=epic_cache,
+            issue_epic_cache=issue_epic_cache
+        )
+
+        rows.append({
+            "Key": key,
+            "Issue Type": issue_type,
+            "Summary": summary,
+            "Status": status,
+            "Assignee": assignee,
+            "Reporter": reporter,
+            "Epic Key": e_key or "",
+            "Epic Summary": e_sum or "",
+            "Fix Versions": fx_names,
+            "Parent": parent_key,
+            "Priority": priority,
+            "Created": created,
+            "Updated": updated,
+        })
+
+    # Optional: sort by Parent asc, then Key (falls JQL sort nicht greift)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(by=["Parent", "Key"], ascending=[True, True])
+
+    # Write workbook in-memory
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        if df.empty:
+            df = pd.DataFrame(columns=[
+                "Key","Issue Type","Summary","Status","Assignee","Reporter",
+                "Epic Key","Epic Summary","Fix Versions","Parent","Priority","Created","Updated"
+            ])
+        df.to_excel(writer, index=False, sheet_name="Results")
+    output.seek(0)
+    return output.read()
+
 # ------------------------ Login / Session ------------------------
 def logged_in() -> bool:
     return "creds" in st.session_state and all(
@@ -422,7 +847,12 @@ BASE, EMAIL, TOKEN, TZ = creds["base"], creds["email"], creds["token"], creds["t
 st.title("📊 Jira Worklogs → Excel")
 st.caption("Generate Excel files from Jira worklogs — no credentials stored server-side. Choose Monthly or Weekly granularity.")
 
-tab1, tab2 = st.tabs(["Month → All employees", "Employee + Time range"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Month → All employees",
+    "Employee + Time range",
+    "Timerange → Hierarchy (Month)",
+    "Custom JQL → Excel"
+])
 
 # ------------------------ Tab 1: Month → All employees ------------------------
 with tab1:
@@ -523,3 +953,104 @@ with tab2:
                 st.error("Request failed.")
                 with st.expander("Error details"):
                     st.code(redact(e, [EMAIL, TOKEN, BASE]))
+
+# ------------------------ Tab 3:  Epic Hier ------------------------
+with tab3:
+    st.subheader("Hierarchische Monatsübersicht (Epic → Workitem → Subtask)")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        h_from_month = st.text_input("Start month (YYYY-MM)", value=default_month, key="t3_from")
+    with c2:
+        h_to_month = st.text_input("End month (YYYY-MM)", value=default_month, key="t3_to")
+
+    h_scope = st.text_input(
+        "Optional JQL scope (e.g., project = ABC)",
+        value="",
+        key="t3_scope"
+    )
+
+    st.markdown("**Feld-IDs für Hierarchie / Scope**")
+    h_epic_link_field = st.text_input(
+        "Epic link field ID (optional, e.g. customfield_10014)",
+        value="",
+        key="t3_epic_link"
+    )
+    h_scope_field = st.text_input(
+        "Scope custom field ID (optional, e.g. customfield_12345)",
+        value="",
+        key="t3_scope_field"
+    )
+
+    st.caption(
+        "Hinweis: "
+        "`release version` wird aus dem Feld `fixVersions` gelesen. "
+        "`Scope` ist ein Custom Field, dessen ID du oben angeben kannst."
+    )
+
+    if st.button("Generate hierarchical Excel (by month)", key="t3_btn"):
+        # Format prüfen
+        try:
+            datetime.strptime(h_from_month + "-01", "%Y-%m-%d")
+            datetime.strptime(h_to_month + "-01", "%Y-%m-%d")
+        except ValueError:
+            st.error("Please provide months as YYYY-MM, e.g., 2025-01 and 2025-03.")
+            st.stop()
+
+        try:
+            st.info("Building hierarchical monthly overview…")
+            xlsx_bytes = export_monthly_hierarchy_by_epic(
+                base=BASE,
+                email=EMAIL,
+                token=TOKEN,
+                from_ym=h_from_month.strip(),
+                to_ym=h_to_month.strip(),
+                jql_scope=h_scope.strip() or None,
+                local_tz=TZ,
+                epic_link_field=h_epic_link_field.strip() or None,
+                scope_field=h_scope_field.strip() or None,
+            )
+            fn = f"worklogs_hierarchical_{h_from_month}_{h_to_month}.xlsx"
+            st.success("Done. Your file is ready.")
+            st.download_button(
+                label="📥 Download Excel (hierarchical)",
+                data=xlsx_bytes,
+                file_name=fn,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.error("Request failed.")
+            with st.expander("Error details"):
+                st.code(redact(e, [EMAIL, TOKEN, BASE]))
+
+
+with tab4:
+    st.subheader("Export issues by JQL")
+
+    # Example JQL prefilled with your request
+    default_jql = 'fixversion = "Version 2.2" AND status NOT IN (abandonded, Abandoned) ORDER BY parent ASC'
+    jql_in = st.text_area("JQL", value=default_jql, height=120,
+                          help='Paste any valid JQL. Uses enhanced search (/rest/api/3/search/jql).')
+
+    if st.button("Generate Excel (JQL results)", key="t4_generate"):
+        if not jql_in.strip():
+            st.warning("Please enter a JQL query.")
+            st.stop()
+        try:
+            st.info("Running JQL and building workbook…")
+            xlsx_bytes = export_jql_issues_excel(
+                base=BASE, email=EMAIL, token=TOKEN,
+                jql=jql_in.strip(), local_tz=TZ
+            )
+            fn = "jql_results.xlsx"
+            st.success("Done. Your file is ready.")
+            st.download_button(
+                label="📥 Download Excel",
+                data=xlsx_bytes,
+                file_name=fn,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.error("Request failed.")
+            with st.expander("Error details"):
+                st.code(redact(e, [EMAIL, TOKEN, BASE]))
