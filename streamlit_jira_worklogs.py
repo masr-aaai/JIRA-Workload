@@ -84,6 +84,97 @@ def week_key_local(dt_local: datetime) -> str:
     iso = dt_local.isocalendar()  # (year, week, weekday)
     return f"{iso[0]:04d}-W{iso[1]:02d}"
 
+# --- Debug controls & helpers (put this once, near the sidebar/auth code) ---
+
+# Toggle in der Sidebar
+with st.sidebar:
+    st.markdown("### 🛠 Debug")
+    st.session_state["DEBUG_ON"] = st.checkbox(
+        "Enable debug logs",
+        value=st.session_state.get("DEBUG_ON", False)
+    )
+
+def _get_debug_flag() -> bool:
+    return bool(st.session_state.get("DEBUG_ON", False))
+
+def dlog(msg, *args):
+    """Write debug messages to the sidebar when DEBUG is on."""
+    if _get_debug_flag():
+        try:
+            st.sidebar.write("🔎", msg.format(*args) if args else msg)
+        except Exception:
+            pass
+
+# Falls du 'redact' nicht im File hast, nimm diese Minimalversion:
+def redact(text: str, secrets) -> str:
+    try:
+        s = str(text)
+    except Exception:
+        return text
+    for sec in secrets or []:
+        if sec:
+            s = s.replace(sec, "******")
+    return s
+
+def _redact_dbg(text: str) -> str:
+    creds = st.session_state.get("creds", {})
+    return redact(text, [creds.get("email",""), creds.get("token",""), creds.get("base","")])
+
+def build_summary_from_month_rows(month_rows: Dict[str, List[Dict[str, Any]]]) -> pd.DataFrame:
+    """
+    Summary: Stunden pro Fix Version & Scope (Planned/Unplanned) je Monat.
+    Erwartet in Monats-Rows: 'Fix Version', 'Scope', 'h logged'
+    """
+    months_sorted = sorted(month_rows.keys())
+    agg: Dict[Tuple[str, str], Dict[str, float]] = {}
+
+    def norm_scope(s: str) -> Optional[str]:
+        if not s:
+            return None
+        s2 = str(s).strip()
+        if s2 == "Planned":
+            return "Planned"
+        if s2 == "Unplanned":
+            return "Unplanned"
+        return None
+
+    for m in months_sorted:
+        rows = month_rows.get(m, [])
+        if not rows:
+            continue
+        dfm = pd.DataFrame(rows)
+        if dfm.empty or any(c not in dfm.columns for c in ["h logged","Scope","Fix Version"]):
+            continue
+
+        hours = pd.to_numeric(dfm["h logged"], errors="coerce").fillna(0.0).astype(float)
+        version = dfm["Fix Version"].fillna("").astype(str)
+        scope   = dfm["Scope"].fillna("").astype(str)
+
+        scope_norm = scope.apply(norm_scope)
+        mask = scope_norm.notna() & hours.notna()
+
+        temp = pd.DataFrame({
+            "version": version[mask],
+            "scope": scope_norm[mask],
+            "hours": hours[mask],
+        })
+        grouped = temp.groupby(["version","scope"], dropna=False)["hours"].sum()
+        for (ver, sc), hsum in grouped.items():
+            agg.setdefault((ver, sc), {})[m] = float(hsum)
+
+    if not agg:
+        return pd.DataFrame(columns=["Version - Scope"] + months_sorted)
+
+    keys_sorted = sorted(agg.keys(), key=lambda x: (x[0], x[1]))
+    rows_out = []
+    for (ver, sc) in keys_sorted:
+        row = {"Version - Scope": f"{ver} - {sc}"}
+        for m in months_sorted:
+            row[m] = round(agg.get((ver, sc), {}).get(m, 0.0), 2)
+        rows_out.append(row)
+
+    return pd.DataFrame(rows_out, columns=["Version - Scope"] + months_sorted)
+
 # ------------------------ Jira HTTP ------------------------
 def jira_req(base: str, email: str, token: str, method: str, path: str, **kwargs):
     url = f"{base.rstrip('/')}{path}"
@@ -182,7 +273,7 @@ def resolve_epic_for_issue(
     issue: Dict[str, Any],
     epic_cache: Dict[str, Optional[str]],
     issue_epic_cache: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
-) -> Tuple[Optional[str], Optional[str]]:
+    ) -> Tuple[Optional[str], Optional[str]]:
     """
     Returns (epic_key, epic_summary) for an issue with proper inheritance:
       1) Team-managed: fields.epic {key|id, name|summary}
@@ -288,6 +379,73 @@ def resolve_epic_for_issue(
     issue_epic_cache[ikey] = (None, None)
     return None, None
 
+def find_custom_field_id(base: str, email: str, token: str, name_candidates=None) -> Optional[str]:
+    """
+    Holt /rest/api/3/field und sucht das Scope-Feld über Namen/Klauseln.
+    Ändert NICHT die JQL-Query; wir erweitern nur die 'fields' Auswahl.
+    """
+    if name_candidates is None:
+        name_candidates = ["Scope", "scope[dropdown]"]
+
+    try:
+        fields = jira_req(base, email, token, "GET", "/rest/api/3/field")
+    except Exception as e:
+        dlog("[scope] Could not list fields: {}", _redact_dbg(e))
+        return None
+
+    want = {s.strip().lower() for s in name_candidates if s and str(s).strip()}
+    best_id = None
+    for fld in fields:
+        fid = fld.get("id")
+        if not fid:
+            continue
+        fname = (fld.get("name") or "").strip().lower()
+        clauses = [c.strip().lower() for c in (fld.get("clauseNames") or []) if isinstance(c, str)]
+        if fname in want or any(c in want for c in clauses):
+            return fid
+        if not best_id and "scope" in fname:
+            best_id = fid
+    return best_id
+
+
+#------------------------- Excel Formatting ------------------------
+
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
+
+def _find_col_idx_by_header(ws, header_name: str) -> int:
+    for cell in ws[1]:
+        if (cell.value or "").strip().lower() == header_name.strip().lower():
+            return cell.column  # 1-based
+    return -1
+
+def apply_conditional_formatting_tab3(ws):
+    """
+    Einzige Regel:
+      - GANZE ZEILE hellgrün, wenn Issue Type == "Epic"
+    """
+    max_row = ws.max_row
+    max_col = ws.max_column
+    if max_col < 1 or max_row < 2:
+        # Freeze+Filter trotzdem setzen
+        ws.auto_filter.ref = f"A1:{get_column_letter(max_col)}1"
+        ws.freeze_panes = "A2"
+        return
+
+    col_type = _find_col_idx_by_header(ws, "Issue Type")
+    if col_type > 0:
+        green = PatternFill(start_color="FFE6FFCC", end_color="FFE6FFCC", fill_type="solid")
+        type_letter = get_column_letter(col_type)
+        ws.conditional_formatting.add(
+            f"A2:{get_column_letter(max_col)}{max_row}",
+            FormulaRule(formula=[f'${type_letter}2="Epic"'], fill=green)
+        )
+
+    # Header fixieren + AutoFilter
+    ws.auto_filter.ref = f"A1:{get_column_letter(max_col)}1"
+    ws.freeze_panes = "A2"
+
 
 # ------------------------ Exports ------------------------
 def export_month_all_staff(base, email, token, ym: str, jql_scope: Optional[str], local_tz: str, grain: str) -> bytes:
@@ -376,6 +534,31 @@ def export_month_all_staff(base, email, token, ym: str, jql_scope: Optional[str]
             pd.DataFrame(overview).sort_values("Employee").to_excel(writer, index=False, sheet_name="Overview")
         if grain == "Weekly" and weekly_overview_rows:
             pd.DataFrame(weekly_overview_rows).sort_values(["Employee", "ISO Week"]).to_excel(writer, index=False, sheet_name="Weekly Overview")
+        # --- Summary-Sheet bauen & schreiben ---
+        summary_df = build_summary_from_month_rows(summary_rows_by_month)
+
+        # existierendes Summary-Blatt ggf. entfernen (falls vorher leer angelegt)
+        try:
+            if "Summary" in writer.book.sheetnames:
+                # openpyxl: Sheet löschen, bevor wir neu schreiben
+                ws_old = writer.book["Summary"]
+                writer.book.remove(ws_old)
+        except Exception:
+            pass
+
+        # schreiben
+        summary_df.to_excel(writer, index=False, sheet_name="Summary")
+
+        # kleines UX-Setup
+        try:
+            ws_sum = writer.book["Summary"]
+        except Exception:
+            ws_sum = writer.sheets.get("Summary")
+        if ws_sum is not None:
+            from openpyxl.utils import get_column_letter
+            max_col = ws_sum.max_column
+            ws_sum.freeze_panes = "A2"
+            ws_sum.auto_filter.ref = f"A1:{get_column_letter(max_col)}1"
 
     output.seek(0)
     return output.read()
@@ -504,76 +687,77 @@ def export_monthly_hierarchy_by_epic(
     to_ym: str,
     jql_scope: Optional[str],
     local_tz: str,
-    epic_link_field: Optional[str] = None,
-    scope_field: Optional[str] = None,
+    epic_link_field: Optional[str] = None,  # ungenutzt
+    scope_field: Optional[str] = None,      # falls None: auto-detect
     ) -> bytes:
     """
-    Für den angegebenen Monats-Zeitraum:
-      - pro Monat ein Sheet
-      - pro Sheet: hierarchische Liste Epic -> Workitem -> Subtask
-      - 'h logged' = Summe der direkten Worklogs auf diesem Issue in diesem Monat
+    Tab 3 – Monats-Export als Baum:
+      - 'parent' = ROHER Jira-Parent (fields.parent.key)
+      - Anzeige als Baum (Epic -> Task -> Subtask); Export-Parent bleibt roh
+      - Fehlende Vorfahren werden mit 0h eingefügt, falls nur im Kind geloggt wurde
+      - 'Issue Type' immer
+      - 'sum h epic' = Summe des Epic-Subtrees
+      - 'Scope (Jira)' = Original aus Scope-Customfield
+      - 'Scope' = nur dann füllen, wenn 'Scope (Jira)' leer war (Parent erben; falls dann noch leer & Typ != Epic -> "Planned")
+      - 'Fix Version' aus fixVersions (CSV)
+      - Summary-Sheet wird fertig mitgeschrieben
+      - Formatierung: nur grüne Zeilen, wenn Issue Type == 'Epic'
     """
     tzinfo_local = ZoneInfo(local_tz)
 
-    # Gesamtzeitraum über alle Monate
+    # Zeitraum
     start_all, _ = month_bounds(from_ym)
-    _, end_all = month_bounds(to_ym)
+    _, end_all   = month_bounds(to_ym)
     date_from = start_all.astimezone(timezone.utc).strftime("%Y-%m-%d")
-    date_to = end_all.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    date_to   = end_all.astimezone(timezone.utc).strftime("%Y-%m-%d")
 
-    # JQL: Einschränkung auf Worklogs im Zeitraum + optionaler Scope
+    # JQL (unverändert) + optionaler Scopefilter
     jql = f'worklogDate >= "{date_from}" AND worklogDate <= "{date_to}"'
     if jql_scope:
         jql = f"({jql_scope}) AND ({jql})"
+    dlog("[tab3] JQL: {}", _redact_dbg(jql))
 
-    # Felder für Hierarchie/Meta
-    fields = ["summary", "issuetype", "parent", "fixVersions"]
-    if epic_link_field:
-        fields.append(epic_link_field)
-    if scope_field:
-        fields.append(scope_field)
+    # Scope-Customfield-ID (auto)
+    scope_field_id = scope_field or find_custom_field_id(base, email, token, ["Scope","scope[dropdown]"])
+    if scope_field_id:
+        dlog("[tab3] detected scope field id: {}", scope_field_id)
+    else:
+        dlog("[tab3] scope field id NOT found; 'Scope (Jira)' will be empty")
 
-    issues = search_issues_jql(
-        base, email, token,
-        jql=jql,
-        fields=fields
-    )
+    # Felderliste (JQL selbst bleibt gleich)
+    fields = ["summary", "issuetype", "parent", "epic", "customfield_10014", "fixVersions"]
+    if scope_field_id:
+        fields.append(scope_field_id)
 
+    issues = search_issues_jql(base, email, token, jql=jql, fields=fields)
+    dlog("[tab3] issues fetched: {}", len(issues))
 
-    # Metadaten der Issues sammeln
+    # Caches
+    epic_cache: Dict[str, Optional[str]] = {}
+    issue_epic_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+
+    # Metadaten
     issue_meta: Dict[str, Dict[str, Any]] = {}
-    parent_map: Dict[str, Optional[str]] = {}
+    raw_parent_map: Dict[str, Optional[str]] = {}
+    issuetype_map: Dict[str, str] = {}
+    epic_name_map: Dict[str, str] = {}
 
+    # Metadaten sammeln
     for it in issues:
         key = it.get("key")
         if not key:
             continue
         f = it.get("fields") or {}
-
         summary = f.get("summary") or ""
         issuetype_name = ((f.get("issuetype") or {}).get("name") or "").strip()
 
-        # --- PARENT-BESTIMMUNG ---
-
+        # roher Parent
         parent_key = None
+        if isinstance(f.get("parent"), dict):
+            parent_key = f["parent"].get("key")
 
-        # 1) "echter" Parent (Subtask, z.B. Story -> Subtask)
-        parent_obj = f.get("parent")
-        if isinstance(parent_obj, dict):
-            parent_key = parent_obj.get("key")
-
-        # 2) Epic-Link (Story/Task unter Epic)
-        if not parent_key and epic_link_field and issuetype_name.lower() != "epic":
-            epic_val = f.get(epic_link_field)
-            if isinstance(epic_val, dict):
-                parent_key = epic_val.get("key") or epic_val.get("id")
-            elif isinstance(epic_val, str):
-                parent_key = epic_val
-            elif epic_val:
-                parent_key = str(epic_val)
-
-        # --- Release Version ---
-        release_version = ""
+        # Fix Versions CSV
+        fix_versions = ""
         fv = f.get("fixVersions") or []
         if isinstance(fv, list):
             names = []
@@ -584,36 +768,51 @@ def export_monthly_hierarchy_by_epic(
                         names.append(str(nm))
                 else:
                     names.append(str(v))
-            release_version = ", ".join(names)
+            fix_versions = ", ".join(names)
 
-        # --- Scope (Custom Field) ---
-        scope_val = ""
-        if scope_field and scope_field in f:
-            sv = f.get(scope_field)
+        # Epic vererbt/aufgelöst
+        e_key, e_sum = resolve_epic_for_issue(
+            base, email, token, it,
+            epic_cache=epic_cache,
+            issue_epic_cache=issue_epic_cache
+        )
+        if e_key and e_sum:
+            epic_name_map[e_key] = e_sum
+
+        # Scope (Jira) direkt aus dem Customfield (wenn vorhanden)
+        scope_jira = ""
+        if scope_field_id and scope_field_id in f:
+            sv = f.get(scope_field_id)
             if isinstance(sv, dict):
-                scope_val = sv.get("value") or sv.get("name") or str(sv)
+                scope_jira = sv.get("value") or sv.get("name") or ""
             elif isinstance(sv, list):
                 parts = []
                 for item in sv:
                     if isinstance(item, dict):
-                        parts.append(item.get("value") or item.get("name") or str(item))
-                    else:
+                        parts.append(item.get("value") or item.get("name") or "")
+                    elif item is not None:
                         parts.append(str(item))
-                scope_val = ", ".join(parts)
+                scope_jira = ", ".join([p for p in parts if p])
             elif sv is not None:
-                scope_val = str(sv)
+                scope_jira = str(sv)
 
         issue_meta[key] = {
             "key": key,
             "summary": summary,
             "issuetype": issuetype_name,
-            "parent": parent_key,          # <--- HIER SPEICHERN WIR DEN PARENT
-            "release_version": release_version,
-            "scope": scope_val,
+            "raw_parent": parent_key,
+            "epic_key": e_key,
+            "epic_summary": e_sum or "",
+            "scope_jira": scope_jira or "",
+            "fix_versions": fix_versions,
         }
-        parent_map[key] = parent_key
+        raw_parent_map[key] = parent_key
+        issuetype_map[key] = issuetype_name
 
-    # Worklogs pro Monat & Issue aufsummieren (nur direkte Logs)
+        dlog("[tab3] meta issue={} type={} raw_parent={} epic=({}, {}) scope_jira='{}' fixVersions={}",
+             key, issuetype_name, parent_key, e_key, e_sum, scope_jira, fix_versions)
+
+    # Stunden pro Monat/Issue
     per_month_issue_hours: Dict[str, Dict[str, float]] = {}
     months = month_iter(from_ym, to_ym)
 
@@ -621,185 +820,206 @@ def export_monthly_hierarchy_by_epic(
         key = it.get("key")
         if not key:
             continue
-
         for wl in collect_issue_worklogs(base, email, token, key):
-            (
-                started_utc, started_local,
-                created_utc, created_local,
-                effective_utc, effective_local
-            ) = extract_worklog_datetimes(wl, tzinfo_local)
-
-            if not effective_utc:
+            (started_utc, started_local,
+             created_utc, created_local,
+             effective_utc, effective_local) = extract_worklog_datetimes(wl, tzinfo_local)
+            if not effective_utc or not effective_local:
                 continue
             if not (start_all <= effective_utc <= end_all):
                 continue
-
             month_key = f"{effective_local.year:04d}-{effective_local.month:02d}"
             if month_key not in months:
-                # Falls wegen Rundung irgendwas leicht rausfällt
                 continue
-
             secs = wl.get("timeSpentSeconds") or 0
             h = secs / 3600.0
-
             per_month_issue_hours.setdefault(month_key, {})
             per_month_issue_hours[month_key][key] = per_month_issue_hours[month_key].get(key, 0.0) + h
 
-    # Hilfsfunktion: alle Vorfahren eines Issues in die Menge aufnehmen
-    def add_ancestors(issue_key: str, active_set: set):
-        current = issue_key
-        visited = set()
-        while True:
-            parent = parent_map.get(current)
-            if not parent or parent in visited:
-                break
-            active_set.add(parent)
-            visited.add(parent)
-            current = parent
-
-    # Excel-Aufbau
+    # Workbook
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary_rows_by_month: Dict[str, List[Dict[str, Any]]] = {}
+
         for m in months:
-            issue_hours = per_month_issue_hours.get(m, {})
+            hours = per_month_issue_hours.get(m, {})
+            active = set(hours.keys())
+            to_include = set(active)
 
-            # Zuerst: alle Issues mit Stunden in diesem Monat
-            active_issues = set(issue_hours.keys())
+            # Vorfahren (roh) einziehen
+            def include_ancestors(issue_key: str):
+                cur = issue_key
+                visited = set()
+                while True:
+                    p = raw_parent_map.get(cur)
+                    if not p or p in visited:
+                        break
+                    to_include.add(p)
+                    visited.add(p)
+                    cur = p
 
-            # Dann: alle Vorfahren (Epics, Workitems ohne direkte Logs etc.) ergänzen
-            for ik in list(active_issues):
-                add_ancestors(ik, active_issues)
+            for k in list(active):
+                include_ancestors(k)
 
-            # Auf Basis dieser Menge die Hierarchie bauen
-            # children_map: parent → [child1, child2, ...]
-            children_map: Dict[Optional[str], List[str]] = {}
-            for ik in active_issues:
-                meta = issue_meta.get(ik)
-                if not meta:
+            # Baum-Eltern (nur Anzeige); Export-Parent bleibt roh
+            tree_parent: Dict[str, Optional[str]] = {k: raw_parent_map.get(k) for k in list(to_include)}
+
+            # Top → Epic hängen (nur Anzeige), Epic-Knoten ggf. anlegen
+            for k in list(active):
+                cur = k
+                seen = set()
+                while raw_parent_map.get(cur) and cur not in seen:
+                    seen.add(cur)
+                    cur = raw_parent_map[cur]
+                top = cur
+                ekey = issue_meta.get(k, {}).get("epic_key")
+                if ekey:
+                    if ekey not in issue_meta:
+                        issue_meta[ekey] = {
+                            "key": ekey,
+                            "summary": epic_name_map.get(ekey, ""),
+                            "issuetype": "Epic",
+                            "raw_parent": None,
+                            "epic_key": None,
+                            "epic_summary": "",
+                            "scope_jira": "",
+                            "fix_versions": "",
+                        }
+                        raw_parent_map[ekey] = None
+                        issuetype_map[ekey] = "Epic"
+                    to_include.add(ekey)
+                    if issuetype_map.get(top) != "Epic":
+                        tree_parent[top] = ekey
+
+            # fehlende Stunden = 0
+            for k in to_include:
+                hours.setdefault(k, 0.0)
+
+            # Scope ableiten NUR wenn „Scope (Jira)“ leer ist
+            scope_jira_for_row: Dict[str, str] = {}
+            derived_scope_for_row: Dict[str, str] = {}
+
+            for k in to_include:
+                scope_jira_for_row[k] = issue_meta.get(k, {}).get("scope_jira", "") or ""
+
+            for k in list(to_include):
+                orig = scope_jira_for_row.get(k, "")
+                if orig:
+                    derived_scope_for_row[k] = orig  # NICHT überschreiben
                     continue
-                p = meta.get("parent")
-                # Nur Eltern berücksichtigen, die ebenfalls in active_issues liegen,
-                # sonst ist es ein Root (parent=None)
-                if p not in active_issues:
-                    p = None
-                children_map.setdefault(p, []).append(ik)
 
-            # Kinder sortieren (z.B. nach Issue-Key)
-            for p in children_map:
-                children_map[p].sort()
+                # Vererbung über *rohe* Parent-Kette
+                cur = raw_parent_map.get(k)
+                guard = set([k])
+                inherited = ""
+                while cur and cur not in guard:
+                    inherited = scope_jira_for_row.get(cur, "") or issue_meta.get(cur, {}).get("scope_jira", "") or ""
+                    if inherited:
+                        break
+                    guard.add(cur)
+                    cur = raw_parent_map.get(cur)
 
-            # Roots: solche ohne Parent in active_issues
-            roots = children_map.get(None, [])
-            roots.sort()
+                if not inherited and issuetype_map.get(k) != "Epic":
+                    inherited = "Planned"   # Default nur wenn vorher leer
+                derived_scope_for_row[k] = inherited
 
+            # Baumkinder
+            children: Dict[Optional[str], List[str]] = {}
+            for k in to_include:
+                children.setdefault(tree_parent.get(k), []).append(k)
+            for p in children:
+                children[p].sort()
+            roots = sorted(children.get(None, []))
+
+            # Subtree-Summen je Epic
+            subtree_total_cache: Dict[str, float] = {}
+            def subtree_total(node: str) -> float:
+                if node in subtree_total_cache:
+                    return subtree_total_cache[node]
+                total = float(hours.get(node, 0.0))
+                for c in children.get(node, []):
+                    total += subtree_total(c)
+                subtree_total_cache[node] = total
+                return total
+
+            epic_totals: Dict[str, float] = {}
+            for n in to_include:
+                if issuetype_map.get(n) == "Epic":
+                    epic_totals[n] = round(subtree_total(n), 2)
+
+            def epic_ancestor(node: str) -> Optional[str]:
+                cur = node
+                guard = set()
+                while cur and cur not in guard:
+                    if issuetype_map.get(cur) == "Epic":
+                        return cur
+                    guard.add(cur)
+                    cur = tree_parent.get(cur)
+                return None
+
+            # DFS Ausgabe
             rows: List[Dict[str, Any]] = []
-
             def walk(node_key: str, depth: int = 0):
-                meta = issue_meta.get(node_key)
-                if not meta:
-                    return
-
-                hours = round(issue_hours.get(node_key, 0.0), 2)
-                parent_key = meta.get("parent") or ""   # <-- das, was wir oben gesetzt haben
-
+                meta = issue_meta.get(node_key, {})
+                epic_for_row = epic_ancestor(node_key)
+                sum_h_epic = epic_totals.get(epic_for_row) if epic_for_row else None
                 rows.append({
-                    "tasknummer": node_key,
-                    "summary": ("  " * depth) + meta.get("summary", ""),
-                    "parent": parent_key,
-                    "h logged": hours,
-                    "release version": meta.get("release_version", ""),
-                    "Scope": meta.get("scope", ""),
+                    "Issue": node_key,
+                    "Issue Type": issuetype_map.get(node_key, ""),
+                    "Summary": ("  " * depth) + (meta.get("summary") or ""),
+                    "parent": meta.get("raw_parent") or "",                     # roh (wie Tab 4)
+                    "h logged": round(float(hours.get(node_key, 0.0)), 2),
+                    "sum h epic": (round(float(sum_h_epic), 2) if sum_h_epic is not None else ""),
+                    "Scope (Jira)": (issue_meta.get(node_key, {}).get("scope_jira", "") or ""),
+                    "Scope": (derived_scope_for_row.get(node_key, "") or ""),
+                    "Fix Version": meta.get("fix_versions", ""),
                 })
-
-                for child in children_map.get(node_key, []):
+                for child in children.get(node_key, []):
                     walk(child, depth + 1)
 
-
             for r in roots:
-                walk(r, depth=0)
+                walk(r, 0)
 
-            # DataFrame bauen; wenn leer, trotzdem leeres Sheet mit Spaltenköpfen
-            if rows:
-                df = pd.DataFrame(rows)
-            else:
-                df = pd.DataFrame(columns=["tasknummer", "summary", "parent", "h logged", "release version", "Scope"])
+            # Für Summary merken
+            summary_rows_by_month[m] = list(rows)
 
-            df.to_excel(writer, index=False, sheet_name=safe_sheet_name(m))
-
-    output.seek(0)
-    return output.read()
-
-
-def export_jql_issues_excel(base, email, token, jql: str, local_tz: str) -> bytes:
-    """
-    Runs an arbitrary JQL (enhanced /search/jql) and exports a flat issue list to Excel.
-    Columns: Key, Issue Type, Summary, Status, Assignee, Reporter, Epic Key, Epic Summary,
-             Fix Versions, Parent, Created, Updated, Priority
-    """
-    # Caches for epic lookups
-    epic_cache: Dict[str, Optional[str]] = {}
-    issue_epic_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-
-    # ask for all fields we might render
-    fields = [
-        "summary", "issuetype", "status", "assignee", "reporter", "priority",
-        "parent", "epic", "customfield_10014", "fixVersions", "created", "updated"
-    ]
-    issues = search_issues_jql(base, email, token, jql=jql, fields=fields)
-
-    rows = []
-    for it in issues:
-        key = it.get("key")
-        f = it.get("fields") or {}
-        issue_type = ((f.get("issuetype") or {}).get("name")) or ""
-        status = ((f.get("status") or {}).get("name")) or ""
-        assignee = ((f.get("assignee") or {}).get("displayName")) or ""
-        reporter = ((f.get("reporter") or {}).get("displayName")) or ""
-        priority = ((f.get("priority") or {}).get("name")) or ""
-        parent_key = (f.get("parent") or {}).get("key") or ""
-        summary = f.get("summary") or ""
-        created = f.get("created") or ""
-        updated = f.get("updated") or ""
-        # Fix Versions (names joined)
-        fx_names = ", ".join([v.get("name") for v in (f.get("fixVersions") or []) if v.get("name")])
-
-        # Resolve epic with inheritance (subtasks inherit parent's epic)
-        e_key, e_sum = resolve_epic_for_issue(
-            base, email, token, it,
-            epic_cache=epic_cache,
-            issue_epic_cache=issue_epic_cache
-        )
-
-        rows.append({
-            "Key": key,
-            "Issue Type": issue_type,
-            "Summary": summary,
-            "Status": status,
-            "Assignee": assignee,
-            "Reporter": reporter,
-            "Epic Key": e_key or "",
-            "Epic Summary": e_sum or "",
-            "Fix Versions": fx_names,
-            "Parent": parent_key,
-            "Priority": priority,
-            "Created": created,
-            "Updated": updated,
-        })
-
-    # Optional: sort by Parent asc, then Key (falls JQL sort nicht greift)
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values(by=["Parent", "Key"], ascending=[True, True])
-
-    # Write workbook in-memory
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if df.empty:
-            df = pd.DataFrame(columns=[
-                "Key","Issue Type","Summary","Status","Assignee","Reporter",
-                "Epic Key","Epic Summary","Fix Versions","Parent","Priority","Created","Updated"
+            # Sheet schreiben + nur Epic-Grün formatieren
+            df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
+                "Issue","Issue Type","Summary","parent","h logged","sum h epic","Scope (Jira)","Scope","Fix Version"
             ])
-        df.to_excel(writer, index=False, sheet_name="Results")
+            sheet_name = safe_sheet_name(m)
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+            try:
+                ws = writer.book[sheet_name]
+            except Exception:
+                ws = writer.sheets.get(sheet_name)
+            if ws is not None:
+                apply_conditional_formatting_tab3(ws)
+
+        # Summary-Blatt erzeugen & schreiben
+        summary_df = build_summary_from_month_rows(summary_rows_by_month)
+
+        # existierendes Summary ggf. entfernen
+        try:
+            if "Summary" in writer.book.sheetnames:
+                ws_old = writer.book["Summary"]
+                writer.book.remove(ws_old)
+        except Exception:
+            pass
+
+        summary_df.to_excel(writer, index=False, sheet_name="Summary")
+
+        try:
+            ws_sum = writer.book["Summary"]
+        except Exception:
+            ws_sum = writer.sheets.get("Summary")
+        if ws_sum is not None:
+            from openpyxl.utils import get_column_letter
+            max_col = ws_sum.max_column
+            ws_sum.freeze_panes = "A2"
+            ws_sum.auto_filter.ref = f"A1:{get_column_letter(max_col)}1"
+
     output.seek(0)
     return output.read()
 
@@ -848,8 +1068,8 @@ st.title("📊 Jira Worklogs → Excel")
 st.caption("Generate Excel files from Jira worklogs — no credentials stored server-side. Choose Monthly or Weekly granularity.")
 
 tab1, tab2, tab3, tab4 = st.tabs([
-    "Month → All employees",
-    "Employee + Time range",
+    "All employees per month",
+    "Employee per time range",
     "Timerange → Hierarchy (Month)",
     "Custom JQL → Excel"
 ])
