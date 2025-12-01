@@ -28,8 +28,12 @@ CONST_E = "AN03"
 START_ROW = 3
 
 
+
 def read_employees(employees_path: Path) -> pd.DataFrame:
-    df = pd.read_excel(employees_path, dtype=str)
+    # Excel-Datei einlesen, aber explizit das letzte Sheet auswählen
+    xls = pd.ExcelFile(employees_path)
+    last_sheet = xls.sheet_names[-1]  # nimmt das letzte Tabellenblatt
+    df = pd.read_excel(xls, sheet_name=last_sheet, dtype=str)
 
     missing = []
     for col in [EMP_RESOURCE_COL, EMP_PERSONAL_COL]:
